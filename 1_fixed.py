@@ -1,7 +1,7 @@
-# PSLV SplashScreen launch node - Enhanced Version
+#  SplashScreen launch node - Enhanced Version
 # =============================================================================
 # Enhanced version with modern UI/UX while maintaining all original functionality
-# This module contains the starting code for PSLV Launcher and loads the initials details for the respective user
+# This module contains the starting code for  Launcher and loads the initials details for the respective user
 # request_ntlm and Sharepoint python packages are for operation related to SharePoint.
 # ***
 
