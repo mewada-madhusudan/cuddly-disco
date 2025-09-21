@@ -1,1686 +1,1234 @@
-"""
-Solution Launcher Window - FIXED VERSION
-================================================================================
-This Module contains the code related to the functionality of listing, installing and managing the solution allowed
-for user. FIXED to address UI responsiveness issues by implementing proper threading for all blocking operations.
-
-Contains implementation of EnvironmentLabel, ApplicationTile, NoAccessWidget, MainWindow, InstallThread
-ADDED: RefreshWorker, AdminCheckWorker, UserDetailsWorker for non-blocking operations
-"""
-
-# Python default package imports
-import getpass
-import os
-import shutil
+# Fixed version of access.py with proper window management
+import asyncio
+import re
 from datetime import datetime
-import datetime, timedelta
 
-# Python third party package imports
-import awmpy
+import numpy
 import pandas as pd
-import numpy as np
 import urllib3
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QObject
-from PyQt6.QtGui import QPixmap, QIcon, QFont, QDesktopServices, QMouseEvent
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QLabel, QLineEdit, QGridLayout, QFrame, QProgressBar, QMessageBox,
-                             QScrollArea, QStackedLayout, QSpacerItem, QMenu, QStackedWidget, QDialog, QProgressDialog)
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread, QSize, QTimer
+from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLabel, QLineEdit, QMessageBox, QWidget, QStackedWidget,
+                             QFrame, QScrollArea, QListWidget, QListWidgetItem, QCheckBox, QComboBox, QProgressDialog,
+                             QTextEdit, QTabWidget)
 from requests_ntlm import HttpNtlmAuth
 from shareplum import Site
 
-# User created module for functionalities
-from access import AccessControlDialog
-from security_check import LauncherSecurity
-from static import resource_path, BETA, UAT, PROD, APP_DIR, expire_sort, DETAILS, SITE_URL, SID, SHAREPOINT_LIST, \
-    BACKUP_FILE_NAME, BACKUP_PATH, STO_CONFIG, LOB, ADMIN, pslv_action_entry, add_new_user_to_userbase
+from static import SHAREPOINT_LIST, SITE_URL, SID, FIELDS, split_user,LOB, STATUS, pslv_action_entry, user_main
 
-# global variable for user id
-user_main = getpass.getuser()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-class RefreshWorker(QThread):
-    """Worker thread for refreshing applications data from SharePoint"""
-    data_loaded = pyqtSignal(object)  # Emits the processed DataFrame
-    error_occurred = pyqtSignal(str)  # Emits error message
-    progress_updated = pyqtSignal(str)  # Emits progress message
+class FormValidator:
+    @staticmethod
+    def validate_text(text):
+        """Validate text field is not empty and contains valid characters"""
+        return bool(text and text.strip() and not re.search('[^]', text))
 
-    def __init__(self):
+    @staticmethod
+    def validate_app_path(text):
+        """Validate text field is not empty and contains an exe path"""
+        return True if text.endswith('.exe') else False
+
+    @staticmethod
+    def validate_date(date_str):
+        """Validate date in DD-MM-YYYY format"""
+        try:
+            if not date_str:
+                return True
+            datetime.strptime(date_str, '%Y-%m-%d')
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def validate_version(version):
+        """Validate version is a valid float"""
+        try:
+            if not version:
+                return True
+            float(version)
+            return True
+        except ValueError:
+            return False
+
+
+class ValidatingLineEdit(QLineEdit):
+    def __init__(self, validation_type, required=False, parent=None):
+        super().__init__(parent)
+        self.validation_type = validation_type
+        self.required = required
+        self.valid = True
+        self.textChanged.connect(self.on_text_changed)
+
+        # Store original stylesheet
+        self.default_style = """
+            QLineEdit {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 8px;
+                background: white;
+            }
+            QLineEdit:focus {
+                border: 1px solid #1976d2;
+            }
+        """
+        self.error_style = """
+            QLineEdit {
+                border: 1px solid #f44336;
+                border-radius: 4px;
+                padding: 8px;
+                background: #fff5f5;
+            }
+        """
+        self.setStyleSheet(self.default_style)
+
+    def validate(self):
+        text = self.text().strip()
+
+        # Check if field is required and empty
+        if self.required and not text:
+            self.set_invalid()
+            return False
+
+        # If field is optional and empty, it's valid
+        if not self.required and not text:
+            self.set_valid()
+            return True
+
+        # Validate based on type
+        if self.validation_type == 'text':
+            valid = FormValidator.validate_text(text)
+        elif self.validation_type == 'date':
+            valid = FormValidator.validate_date(text)
+        elif self.validation_type == 'version':
+            valid = FormValidator.validate_version(text)
+        elif self.validation_type == 'app':
+            valid = FormValidator.validate_app_path(text)
+        else:
+            valid = True
+
+        if valid:
+            self.set_valid()
+        else:
+            self.set_invalid()
+
+        return valid
+
+    def set_valid(self):
+        self.valid = True
+        self.setStyleSheet(self.default_style)
+
+    def set_invalid(self):
+        self.valid = False
+        self.setStyleSheet(self.error_style)
+
+    def on_text_changed(self):
+        """Reset validation state when user starts typing"""
+        if not self.valid:
+            self.setStyleSheet(self.default_style)
+
+
+class AppTileWidget(QFrame):
+    def __init__(self, name, description, parent=None):
+        super().__init__(parent)
+        self.setObjectName("appTile")
+        self.is_selected = False
+        self.setFixedSize(300, 100)
+        self.setup_ui(name, description)
+
+    def setup_ui(self, name, description):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(2)
+
+        # App name with icon in horizontal layout
+        name_layout = QHBoxLayout()
+
+        name_label = QLabel(name)
+        name_label.setProperty("appName", True)
+        name_label.setWordWrap(True)
+        name_layout.addWidget(name_label)
+        name_layout.addStretch()
+
+        # Description
+        desc_label = QLabel(description)
+        desc_label.setProperty("appDescription", True)
+        desc_label.setWordWrap(True)
+
+        layout.addLayout(name_layout)
+        layout.addWidget(desc_label)
+        layout.addStretch()
+
+    def set_selected(self, selected):
+        self.is_selected = selected
+        if selected:
+            self.setProperty("selected", True)
+        else:
+            self.setProperty("selected", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def sizeHint(self):
+        return QSize(300, 100)
+
+
+class VerificationWorker(QObject):
+    finished = pyqtSignal(dict)
+
+    def __init__(self, user_ids):
         super().__init__()
-        self.should_stop = False
+        self.user_ids = user_ids
+
+    async def verify_user_id(self, user_id):
+        """
+        Verify a single user ID using the API
+        Replace the URL and any necessary headers/auth for your API
+        """
+        try:
+            # Replace with your actual API endpoint
+            response = numpy.get_phonebook_data(user_id)
+            return user_id, response['standardID'] == user_id
+        except:
+            return user_id, False
+
+    async def verify_multiple_ids(self):
+        """
+        Verify multiple user IDs concurrently
+        """
+        tasks = [self.verify_user_id(uid) for uid in self.user_ids]
+        results = await asyncio.gather(*tasks)
+        return {uid: is_valid for uid, is_valid in results}
 
     def run(self):
-        """Run the refresh operation in background thread"""
+        """
+        Run the verification process
+        """
+        async def run_async():
+            results = await self.verify_multiple_ids()
+            self.finished.emit(results)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_async())
+        loop.close()
+
+
+def is_valid(text):
+    return bool(text.strip())
+
+
+class AccessControlDialog(QDialog):
+    def __init__(self, username, lob, parent=None):
+        super().__init__(parent)  # FIXED: Ensure proper parent reference
+        self.username = username
+        self.lob = lob
+        self.existing_users_list = None
+        self.progress_dialog = None
+        self.workers = []  # Keep track of running threads
+        self.setWindowTitle("Access Management")
+        self.setMinimumSize(900, 600)
+        
+        # FIXED: Set window modality to prevent separate windows
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        
+        self.refresh_data()
+        self.setup_ui()
+
+    def show_loading_dialog(self):
+        """Show an indefinite progress dialog"""
+        # FIXED: Ensure progress dialog has proper parent reference
+        self.progress_dialog = QProgressDialog("Registering Solution to system...", None, 0, 0, self)
+        self.progress_dialog.setWindowTitle("Please Wait")
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setCancelButton(None)  # Remove cancel button
+        self.progress_dialog.setMinimumDuration(0)  # Show immediately
+        self.progress_dialog.setStyleSheet("""
+            QProgressDialog {
+                background-color: white;
+                min-width: 300px;
+            }
+            QLabel {
+                color: #333;
+                font-size: 13px;
+                padding: 10px;
+            }
+            QProgressBar {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                text-align: center;
+                padding: 1px;
+            }
+            QProgressBar::chunk {
+                background-color: #1976d2;
+                border-radius: 3px;
+            }
+        """)
+
+    def refresh_data(self):
+        """Fetch fresh data from the API"""
         try:
-            self.progress_updated.emit("Connecting to SharePoint...")
-            
-            user = user_main.lower()
-            # Initialize SharePoint client with timeout
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            cred = HttpNtlmAuth(SID, password="")
+            # Create sharepoint session for sharepoint list
+            cred = HttpNtlmAuth(SID, "")
+            site = Site(SITE_URL, auth=cred, verify_ssl=True)
 
-            # Create site connection with timeout
-            site = Site(SITE_URL, auth=cred, verify_ssl=False, timeout=30)
-            
-            if self.should_stop:
-                return
-
-            self.progress_updated.emit("Fetching application data...")
-            
             # Fetch data from SharePoint list
             sp_list = site.List(SHAREPOINT_LIST)
             sp_data = sp_list.GetListItems(view_name=None)
-            
-            if self.should_stop:
-                return
-                
-            self.progress_updated.emit("Processing data...")
-            
             df_all = pd.DataFrame(sp_data)
-            df_all.fillna(value='', inplace=True)
-            df_all['SIDs_For_SolutionAccess'] = df_all['SIDs_For_SolutionAccess'].str.lower()
-            all_df = df_all[df_all['SIDs_For_SolutionAccess'].str.contains('everyone', na=False)]
-            processed_df = df_all[df_all['SIDs_For_SolutionAccess'].str.contains(user, na=False)]
-            processed_df = pd.concat([all_df, processed_df])
-            processed_df.reset_index(inplace=True, drop=True)
-            
-            # Save backup
-            try:
-                os.makedirs(f"{os.environ.get('USERPROFILE')}/{BACKUP_PATH}", exist_ok=True)
-                processed_df.to_excel(
-                    excel_writer=f"{os.environ.get('USERPROFILE')}/{BACKUP_PATH}/{BACKUP_FILE_NAME}",
-                    index=False
-                )
-            except Exception as backup_error:
-                print(f"Warning: Could not save backup: {backup_error}")
-            
-            self.data_loaded.emit(processed_df)
-            
-        except Exception as e:
-            # Try to load from backup
-            try:
-                backup_path = f"{os.environ.get('USERPROFILE')}/{BACKUP_PATH}/{BACKUP_FILE_NAME}"
-                if os.path.exists(backup_path):
-                    processed_df = pd.read_excel(backup_path)
-                    self.data_loaded.emit(processed_df)
-                    self.error_occurred.emit("Loaded from backup due to connection error")
-                else:
-                    empty_df = pd.DataFrame(
-                        columns=['Expired', 'Solution_Name', 'Description', 'ApplicationExePath', 'Status',
-                                'Release_Date', 'Validity_Period', 'Version_Number', 'UMAT_IAHub_ID'])
-                    self.data_loaded.emit(empty_df)
-                    self.error_occurred.emit("No backup available. Please check your connection.")
-            except Exception as backup_error:
-                empty_df = pd.DataFrame(
-                    columns=['Expired', 'Solution_Name', 'Description', 'ApplicationExePath', 'Status',
-                            'Release_Date', 'Validity_Period', 'Version_Number', 'UMAT_IAHub_ID'])
-                self.data_loaded.emit(empty_df)
-                self.error_occurred.emit(f"Failed to refresh: {str(e)}")
-
-    def stop(self):
-        """Stop the worker thread"""
-        self.should_stop = True
-
-
-class AdminCheckWorker(QThread):
-    """Worker thread for checking administrator privileges"""
-    admin_check_complete = pyqtSignal(bool, object)  # is_admin, managed_lob
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-
-    def run(self):
-        """Check administrator privileges in background thread"""
-        try:
-            cred = HttpNtlmAuth(SID, password="")
-            site = Site(SITE_URL, auth=cred, verify_ssl=False, timeout=30)
-            
-            # Fetch data from SharePoint list
-            sp_list = site.List(ADMIN)
-            query = {'Where': [('Contains', 'sid', user_main)]}
-            
-            # Fetch items with the query and row limit
-            sp_data = sp_list.GetListItems(query=query)
-            df = pd.DataFrame(sp_data)
-            df.fillna(value='', inplace=True)
-            managed_lob = df['lob'].tolist()
-            
-            is_admin = len(managed_lob) > 0
-            self.admin_check_complete.emit(is_admin, managed_lob)
-            
-        except Exception as e:
-            self.admin_check_complete.emit(False, [])
-            self.error_occurred.emit(f"Failed to check admin privileges: {str(e)}")
-
-
-class UserDetailsWorker(QThread):
-    """Worker thread for fetching user details from phonebook API"""
-    user_details_loaded = pyqtSignal(list, str)  # details, cost_center
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, userdata):
-        super().__init__()
-        self.userdata = userdata
-
-    def run(self):
-        """Fetch user details in background thread"""
-        try:
-            if self.userdata.empty:
-                # Call phonebook API with timeout handling
-                data = awmpy.get_phonebook_data(user_main)
-                cost_center = data['costCenterID']
-                data['email'] = data['email'].replace('@', '@ ')
-                details = [
-                    (data['standardID'], 'icons8-id-50.png'),
-                    (data['nameFull'], 'icons8-user-64.png'),
-                    (data['email'], 'icons8-email-50.png'),
-                    (data['jobTitle'], 'icons8-new-job-50.png'),
-                    (data['buildingName'], 'icons8-location-50.png')
-                ]
-                
-                # Add user to userbase in background
-                try:
-                    add_new_user_to_userbase(
-                        [data['standardID'], data['nameFull'], data['email'], 
-                         data['jobTitle'], data['buildingName'], data['costCenterID']]
-                    )
-                except Exception as add_error:
-                    print(f"Warning: Could not add user to userbase: {add_error}")
-                    
-            else:
-                cost_center = self.userdata['cost_center_id'].values[0]
-                details = [
-                    (self.userdata['sid'].values[0], 'icons8-id-50.png'),
-                    (self.userdata['display_name'].values[0], 'icons8-user-64.png'),
-                    (self.userdata['email'].values[0], 'icons8-email-50.png'),
-                    (self.userdata['job_title'].values[0], 'icons8-new-job-50.png'),
-                    (self.userdata['building_name'].values[0], 'icons8-location-50.png')
-                ]
-            
-            self.user_details_loaded.emit(details, cost_center)
-            
-        except Exception as e:
-            # Fallback to default details
-            self.user_details_loaded.emit(DETAILS, "")
-            self.error_occurred.emit(f"Failed to fetch user details: {str(e)}")
-
-
-class EnvironmentLabel(QLabel):  # Usage - Mewada,Madhusudan
-    """
-    QLabel inherited custom element for displaying solution deployed environment
-    Allowed Environment : UAT/BETA/PROD
-    """
-
-    def __init__(self, env_type, parent=None):  # Mewada,Madhusudan
-        """
-        Initialization of QLabel customized instance
-        :param env_type: UAT/BETA/PROD as string
-        :param parent:
-        """
-        if len(env_type) > 4:
-            env_type = env_type[:5]
-        super().__init__(env_type, parent)
-        self.env_type = env_type
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # Style based on environment type
-        if env_type == "PROD":
-            bg_color = PROD
-        elif env_type == "UAT":  # UAT
-            bg_color = UAT
-        else:
-            bg_color = BETA
-
-        self.setStyleSheet(f"""
-            background-color: {bg_color};
-            color: white;
-            border-radius: 10px;
-            padding: 2px 8px;
-            font-size: 12px;
-            font-weight: bold;
-            font-family: Montserrat, serif;
-        """)
-        self.setFixedHeight(20)
-        self.setFixedWidth(60)
-
-
-class InstallThread(QThread):  # Usage - Mewada,Madhusudan
-    """
-    InstallThread a thread inherited class, which handles installation/copy of program from sharedrive to user system
-    """
-
-    progress = pyqtSignal(int)  # progress signal for installation progress
-    finished = pyqtSignal()  # installation finish signal
-    error = pyqtSignal(str)  # Error signal for handling error in installation
-
-    def __init__(self, source, destination):  # Mewada,Madhusudan
-        """
-        initialize the source and destination location for solution
-        :param source: path (string)
-        :param destination: path (string)
-        """
-        super().__init__()
-        self.source = source
-        self.destination = destination
-
-    def run(self):  # Mewada,Madhusudan
-        """
-        thread function which handles solution movement in chunk to keep faster speed and show progress
-        :return:
-        """
-        try:
-            if not os.path.exists(self.source):
-                raise FileNotFoundError(f"Source file not found: {self.source}")
-
-            total_size = os.path.getsize(self.source)  # fetch size of solution
-            copied_size = 0  # initialize the copied size to 0
-            with open(self.source, 'rb') as src, open(self.destination, 'wb') as dst:
-                # copy the chunked data till file is copied completely
-                while True:
-                    chunk = src.read(1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-                    copied_size += len(chunk)
-                    progress = int((copied_size / total_size) * 100)
-                    self.progress.emit(progress)
-            self.finished.emit()
-        except FileNotFoundError as e:
-            self.error.emit(str(e))
-        except Exception as e:
-            self.error.emit(f"Installation error: {str(e)}")
-
-
-class ApplicationTile(QFrame):  # 2 usages - Mewada,Madhusudan
-    """
-    Custom Application Tile based on QFrame containing all necessary tile elements
-    """
-
-    def __init__(self, app_name, app_description, shared_drive_path, environment,  # Mewada,Madhusudan
-                 release_date, validity_period, version_number, registration_id, parent=None):
-        # Initialization of all variables and sub UI elements
-        super().__init__(parent)
-        # Store all the data
-        self.elements = None
-        self.app_name = app_name
-        self.app_description = app_description
-        self.shared_drive_path = shared_drive_path
-        self.environment = environment
-        self.release_date = release_date
-        self.validity_period = validity_period
-        self.version_number = version_number  # This is the version from DB
-        self.registration_id = registration_id
-
-        # Set up paths and database connection
-        self.install_path = os.environ.get('USERPROFILE')  # %USERPROFILE%
-        self.install_path = os.path.join(f"{self.install_path}\\{APP_DIR}", app_name)
-
-        # Initialize version tracking
-        self.installed_version = self.get_installed_version()
-        self.installed = self.is_app_installed(f"{self.install_path}" + "\\" + f"{self.app_name}.exe")
-
-        # set context policy
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-
-        # Check status
-        self.is_expired = self.check_validity()
-        self.update_available = self.check_update_available()
-
-        # Initialize flip state
-        self.is_flipped = False
-
-        # Create both sides of the tile
-        self.front_widget = QWidget()
-        self.back_widget = QWidget()
-        self.stacked_layout = QStackedLayout(self)
-
-        self.setup_front_ui()
-        self.setup_back_ui()
-
-        # Add both sides to the stacked layout
-        self.stacked_layout.addWidget(self.front_widget)
-        self.stacked_layout.addWidget(self.back_widget)
-
-        # Setup mouse click handling
-        self.customContextMenuRequested.connect(self.show_context_menu)
-
-        # Set initial styling
-        self.setFixedHeight(200)
-        self.setFixedWidth(287)
-        self.setup_styles()
-
-        # Add overlay if expired
-        if self.is_expired:
-            self.add_expired_overlay()
-
-    def show_context_menu(self, position):  # 1 usage - Mewada,Madhusudan
-        """
-        right context menu for application tile
-        :param position: (x,y) position of click(tuple)
-        :return:
-        """
-        context_menu = QMenu(self)
-        context_menu.setStyleSheet("""
-            QMenu {
-                background-color: white;
-                border: 1px solid #88bbf7;
-                border-radius: 5px;
-                padding: 5px;
-            }
-            QMenu::item {
-                padding: 5px 20px;
-                border-radius: 3px;
-            }
-            QMenu::item:selected {
-                background-color: #88bbf7;
-                color: 88bbf7;
-            }
-        """)
-
-        # Add menu actions
-        flip_action = context_menu.addAction("Flip")
-
-        # Show menu and handle selection
-        action = context_menu.exec(self.mapToGlobal(position))
-        if action == flip_action:
-            self.flip_tile()
-
-    def on_tile_clicked(self, event: QMouseEvent):  # Mewada,Madhusudan
-        # handles flip context menu operation
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.flip_tile()
-            if self.is_expired and self.is_flipped is False:
-                self.add_expired_overlay()
-
-    def grey_it_out(self):  # 1 usage - Mewada,Madhusudan
-        """
-        this module resets all the application tile elements with greyish hue to implement Gray Overlay
-        :return:
-        """
-        for widget in self.elements:
-            widget.setDisabled(True)
-
-        self.env_label.setStyleSheet(f"""
-            background-color: #A9A9A9;
-            color: white;
-            border-radius: 10px;
-            padding: 2px 8px;
-            font-size: 12px;
-            font-weight: bold;
-            font-family: Montserrat, serif;
-        """)
-
-        self.name_label.setStyleSheet(
-            "font-weight: bold; font-size: 18px; color: #A9A9A9;font-family: Montserrat, serif;")  # A9A9A9  D3D3D3
-
-        self.description_label.setStyleSheet("color: #A9A9A9; margin-bottom: 10px;font-family: Montserrat, serif;")
-
-        self.status_label.setStyleSheet("""
-            color: #A9A9A9;
-            font-weight: bold;
-            margin-top: 5px;
-            font-family: Montserrat, serif;
-        """)
-
-        self.uninstall_button.setStyleSheet("""
-            QPushButton {
-                background-color: #10101060;
-                color: white;
-                border: none;
-                padding: 8px 2px;
-                border-radius: 5px;
-                font-weight: bold;
-                font-family: Montserrat, serif;
-            }
-        """)
-
-        self.install_launch_button.setStyleSheet("""
-            QPushButton {
-                background-color: #10101060;
-                color: white;
-                border: none;
-                padding: 8px 2px;
-                border-radius: 5px;
-                font-weight: bold;
-                font-family: Montserrat, serif;
-            }
-        """)
-
-    def setup_back_ui(self):  # 1 usage - Mewada,Madhusudan
-        """
-        This method creates the back/flipped layout for application tile with all elements added
-        :return:
-        """
-        main_layout = QVBoxLayout(self.back_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(2)
-
-        # Style definitions
-        container_style = """
-            QWidget {
-                background-color: #ffffff;
-                padding: 17px;
-            }
-        """
-
-        label_style = """
-            QLabel {
-                color: #666666;
-                font-size: 9px;
-            }
-        """
-
-        value_style = """
-            QLabel {
-                color: #2c3e50;
-                font-size: 11px;
-                font-weight: bold;
-            }
-        """
-
-        expired_note_style = """
-            QLabel {
-                color: #e74c3c;
-                font-size: 12px;
-                border-radius: 5px;
-                background-color: #fadbd8;
-            }
-        """
-
-        # local scoped method to create detail containers
-        def create_detail_container(title, value):  # Mewada,Madhusudan
-            container = QWidget()
-            container.setStyleSheet(container_style)
-            container_layout = QVBoxLayout(container)
-            container_layout.setSpacing(5)
-
-            # Title
-            title_label = QLabel(title)
-            title_label.setStyleSheet(label_style)
-            container_layout.addWidget(title_label)
-
-            # Value
-            value_label = QLabel(str(value))
-            value_label.setStyleSheet(value_style)
-            value_label.setWordWrap(True)
-            container_layout.addWidget(value_label)
-
-            return container
-
-        # Add detail containers
-        details = [
-            ("IAHub ID", "Not Registered" if self.registration_id is np.nan else str(self.registration_id)),
-            ("Release Date", str(pd.Timestamp(self.release_date))[:10]),
-            ("Status", "Expired" if self.is_expired else "Active")
-        ]
-
-        for title, value in details:
-            container = create_detail_container(title, value)
-            main_layout.addWidget(container)
-
-            # Conditional add expired note if status is 'Expired'
-            if self.is_expired:
-                note_container = QWidget()
-                note_layout = QVBoxLayout(note_container)
-                if self.registration_id is np.nan and self.environment == 'BETA':
-                    expired_note = QLabel("⚠ Kindly register the application at IAHub portal.")
-                else:
-                    expired_note = QLabel(
-                        "⚠ Application has expired. Contact Think_STO@restricted.chase.com for renewal.")
-                expired_note.setStyleSheet(expired_note_style)
-                expired_note.setWordWrap(True)
-                expired_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                note_layout.addWidget(expired_note)
-                main_layout.addWidget(note_container)
-
-                # Add stretch to push everything to the top
-                main_layout.addStretch()
-            else:
-                release_date = pd.Timestamp(self.release_date)
-                expiry_date = release_date + timedelta(days=self.validity_period)
-                container = create_detail_container("Validity", str(pd.Timestamp(expiry_date))[:10])
-                main_layout.addWidget(container)
-
-    def setup_front_ui(self):
-        """Usage: Mewada,Madhusudan"""
-        # This contains the original tile UI
-        layout = QVBoxLayout(self.front_widget)
-        layout.setContentsMargins(10, 10, 10, 10)
-
-        # Header layout with name and environment label
-        header_layout = QHBoxLayout()
-        self.name_label = QLabel(self.app_name)
-        self.name_label.setStyleSheet(
-            "font-weight: bold; font-size: 18px; color: #333;font-family: Montserrat, serif;")
-        header_layout.addWidget(self.name_label)
-
-        self.env_label = EnvironmentLabel(self.environment)
-        header_layout.addWidget(self.env_label, alignment=Qt.AlignmentFlag.AlignRight)
-        layout.addLayout(header_layout)
-
-        # Description label
-        self.description_label = QLabel(self.app_description.strip())
-        self.description_label.setWordWrap(True)
-        self.description_label.setFixedHeight(80)
-        self.description_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.description_label.setStyleSheet("color: #666; margin-bottom: 10px;font-family: Montserrat, serif;")
-        layout.addWidget(self.description_label)
-
-        # Buttons
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(10)
-
-        self.install_launch_button = QPushButton("Install")
-        self.install_launch_button.clicked.connect(self.on_install_launch_clicked)
-        self.uninstall_button = QPushButton("Uninstall")
-        self.uninstall_button.setEnabled(True)
-        self.uninstall_button.clicked.connect(self.on_uninstall_clicked)
-
-        self.install_launch_button.setStyleSheet("""
-                    QPushButton {
-                        background-color: #00477b;
-                        color: white;
-                        border: none;
-                        padding: 8px 2px;
-                        border-radius: 5px;
-                        font-weight: bold;
-                        font-family: Montserrat, serif;
-                    }
-                    QPushButton:hover {
-                        background-color: #2670a9;
-                    }
-                """)
-
-        self.uninstall_button.setStyleSheet("""
-                    QPushButton {
-                        background-color: #c5c9d0;
-                        color: white;
-                        border: none;
-                        padding: 8px 2px;
-                        border-radius: 5px;
-                        font-weight: bold;
-                        font-family: Montserrat, serif;
-                    }
-                    QPushButton:hover {
-                        background-color: #d9dde3;
-                    }
-                """)
-
-        button_layout.addWidget(self.install_launch_button)
-        button_layout.addWidget(self.uninstall_button)
-        layout.addLayout(button_layout)
-
-        # Status label
-        self.status_label = QLabel("Not Installed")
-        self.status_label.setStyleSheet("""
-                    color: #6c757d;
-                    font-weight: bold;
-                    margin-top: 5px;
-                    font-family: Montserrat, serif;
-                """)
-        layout.addWidget(self.status_label, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet("""
-                    QProgressBar {
-                        border: 1px solid #e0e0e0;
-                        border-radius: 5px;
-                        text-align: center;
-                        background-color: #f8f9fa;
-                        height: 10px;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #4a90e2;
-                        border-radius: 5px;
-                    }
-                """)
-        layout.addWidget(self.progress_bar)
-
-        # Add tile hover effect
-        self.setStyleSheet("""
-                    ApplicationTile {
-                        background-color: white;
-                        border-radius: 10px;
-                        border: 1px solid #e0e0e0;
-                        font-family: Montserrat, serif;
-                    }
-                    ApplicationTile:hover {
-                        border: 1px solid #4a90e2;
-                        box-shadow: 0 4px 8px rgba(74, 144, 226, 0.1);
-                    }
-                """)
-
-        # Update initial button states
-        if self.is_app_installed(f'{self.install_path}.exe'):
-            self.installed = True
-            self.uninstall_button.setEnabled(True)
-        self.update_button_states()
-
-    def flip_tile(self):
-        """2 usages - Mewada,Madhusudan"""
-        # Animate the flip tile action
-        self.is_flipped = not self.is_flipped
-        self.stacked_layout.setCurrentIndex(1 if self.is_flipped else 0)
-
-    def setup_styles(self):
-        """1 usage - Mewada,Madhusudan"""
-        # default empty tile stylesheet definition
-        self.setStyleSheet("""
-                    ApplicationTile {
-                        background-color: white;
-                        border-radius: 10px;
-                        border: 1px solid #e0e0e0;
-                        font-family: Montserrat, serif;
-                    }
-                    ApplicationTile:hover {
-                        border: 1px solid #4a90e2;
-                        box-shadow: 0 4px 8px rgba(74, 144, 226, 0.1);
-                    }
-                """)
-
-    def add_expired_overlay(self):
-        """2 usages - Mewada,Madhusudan"""
-        # Method to be called for adding the overlay on application tile
-        # :return:
-        self.elements = [self.progress_bar, self.status_label, self.install_launch_button,
-                         self.uninstall_button, self.description_label, self.name_label, self.env_label]
-        # Create overlay widget
-        self.overlay = QWidget(self)
-
-        # Style the overlay
-        self.overlay.setStyleSheet("""
-                    background-color: rgba(0, 0, 0, 0.5);
-                    border-radius: 10px;
-                    backdrop-filter: blur(10px);
-                """)
-
-        # Ensure overlay covers the entire tile
-        self.overlay.setGeometry(self.rect())
-        self.overlay.show()
-
-        # Disable all controls
-        self.front_widget.setEnabled(False)
-        self.grey_it_out()
-
-        # Update the resize event to handle overlay positioning
-        def resizeEvent(self, event):
-            super().resizeEvent(event)
-            if hasattr(self, 'overlay'):
-                self.overlay.setGeometry(self.rect())
-
-        # Add the resizeEvent method to the class
-        self.resizeEvent = resizeEvent.__get__(self, type(self))
-
-    def on_install_launch_clicked(self):
-        """2 usages - Mewada,Madhusudan"""
-        # Method with clauses to handle button status
-        # :return:
-        if self.update_available:
-            self.update_application()
-        elif not self.installed:
-            self.install_application()
-        else:
-            self.launch_application()
-
-    def is_app_installed(self, local_path):
-        """3 usages - Mewada,Madhusudan"""
-        # check app installation status
-        return os.path.exists(local_path)
-
-    def install_application(self):
-        """2 usages - Mewada,Madhusudan"""
-        # Method which calls thread for installation of solution
-        # :return: None
-        pslv_action_entry([{'SID': user_main, 'action': f'Installing {self.app_name}'}])
-        self.progress_bar.setVisible(True)
-        self.status_label.setText("Installing...")
-        self.status_label.setStyleSheet("color: #7c92a6;font-family: Montserrat, serif;")
-
-        # Create the installation directory if it doesn't exist
-        os.makedirs(self.install_path, exist_ok=True)
-
-        # Get the destination file path
-        destination_file = os.path.join(self.install_path, f"{self.app_name}.exe")
-
-        self.install_thread = InstallThread(self.shared_drive_path, destination_file)
-        self.install_thread.progress.connect(self.update_progress)
-        self.install_thread.finished.connect(self.installation_finished)
-        self.install_thread.error.connect(self.installation_error)
-        self.install_thread.start()
-
-    def installation_error(self, error_message):
-        """1 usage - Mewada,Madhusudan"""
-        # Installation error handling method for thread
-        # :param error_message: QMessageBox alert
-        # :return:
-        self.progress_bar.setVisible(False)
-        self.status_label.setText("Installation Failed")
-        self.status_label.setStyleSheet("color: red;")
-        QMessageBox.critical(self, "Installation Error", f"Failed to install {self.app_name}: {error_message}")
-
-    def update_progress(self, value):
-        """1 usage - Mewada,Madhusudan"""
-        self.progress_bar.setValue(value)
-
-    def installation_finished(self):
-        """1 usage - Mewada,Madhusudan"""
-        # This method marks finish of solution installation process
-        # :return: QMessageBox Info
-        self.installed = True
-        self.save_installed_version()  # Save version info after successful installation
-        self.installed_version = self.version_number  # Update the installed version
-        self.update_available = False  # Reset update flag after successful installation
-        self.update_button_states()
-        self.progress_bar.setVisible(False)
-        QMessageBox.information(self, "Installation Complete",
-                                f"{self.app_name} has been successfully installed.")
-
-    def launch_application(self):
-        """1 usage - Mewada,Madhusudan"""
-        # Implementation of application launch logic here
-        pslv_action_entry([{'SID': user_main, 'action': f'Launched {self.app_name}'}])
-        executable_path = os.path.join(self.install_path, f"{self.app_name}.exe")
-        release_date = pd.Timestamp(self.release_date)
-        expiry_date = release_date + timedelta(days=self.validity_period)
-        days_remaining = expiry_date - datetime.now()
-        if os.path.exists(executable_path):
-            try:
-                if self.registration_id is np.nan and self.environment == 'BETA':
-                    QMessageBox.warning(self, 'Action Required',
-                                        f'Application is not registered at IA Hub and will stop working in {days_remaining.days} days.')
-                    # Generate launch token before starting the application
-                    LauncherSecurity.generate_launch_token(executable_path)
-                    os.startfile(executable_path)
-            except Exception as e:
-                QMessageBox.critical(self, 'Error', f'Failed to launch application: {str(e)}')
-        else:
-            QMessageBox.warning(self, 'Error', f'Application executable not found at {executable_path}')
-
-    def on_uninstall_clicked(self):
-        """2 usages - Mewada,Madhusudan"""
-        # Method to handle the uninstallation process for solution
-        # :return: MessageBox Info
-        if self.installed:
-            try:
-                shutil.rmtree(self.install_path)
-                self.installed = False
-                self.status_label.setText("Not Installed")
-                self.status_label.setStyleSheet("""color: #6c757d;
-                                                               font-weight: bold;
-                                                               margin-top: 5px;
-                                                               font-family: Montserrat, serif;""")
-                self.install_launch_button.setText("Install")
-                pslv_action_entry([{'SID': user_main, 'action': f'Uninstalled {self.app_name}'}])
-                QMessageBox.information(self, 'Uninstall Complete',
-                                        f'{self.app_name} has been successfully uninstalled.')
-            except Exception as e:
-                QMessageBox.warning(self, 'Uninstall Error', f'Failed to uninstall {self.app_name}: {str(e)}')
-
-    def check_validity(self):
-        """1 usage - Mewada,Madhusudan"""
-        # Method to check validity of the solution for selected solution
-        # :return: bool
-        try:
-            release_date = pd.Timestamp(self.release_date)
-            expiry_date = release_date + timedelta(days=self.validity_period)
-            return datetime.now() > expiry_date
-        except Exception as e:
-            print(f"Error checking validity: {str(e)}")
+            df_all.fillna('', inplace=True)
+            self.df = df_all[df_all['LOB'].isin(self.lob)]
+            self.df['Description'] = self.df['Description'].str.slice(0, 50)
+            self.df.reset_index(inplace=True, drop=True)
+            return True
+        except:
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(self, "Refresh Failed",
+                                "Failed to load solution list. Kindly retry after sometime.",
+                                QMessageBox.StandardButton.Ok)
             return False
 
-    def check_update_available(self):
-        """1 usage - Mewada,Madhusudan"""
-        # method which identifies solution needing update/has received updates
-        # :return: bool
-        try:
-            installed_version = self.get_installed_version()
-            if self.version_number and self.installed:
-                if installed_version is None:
-                    # If version file is missing but app is installed, assume it needs update
-                    return True
-                return float(self.version_number) > float(installed_version)
-            return False
-        except Exception as e:
-            print(f"Error checking for updates: {str(e)}")
-            return False
+    def setup_ui(self):
+        # We are combine all large container widget to main space here
 
-    def update_button_states(self):
-        """4 usages - Mewada,Madhusudan"""
-        # method which handles the visibility of install/update/launch button
-        # :return: None
-        if self.is_expired:
-            self.status_label.setText("Application Expired" if self.environment == "PROD" else "UAT Period Expired")
-            self.status_label.setStyleSheet("color: #dc3545; font-weight: bold;")
-            self.install_launch_button.setEnabled(False)
-            self.uninstall_button.setEnabled(False)
-            return
-        if self.update_available:
-            self.install_launch_button.setText("Update")
-            self.status_label.setText("Update Available")
-            self.status_label.setStyleSheet("color: #ff9800; font-weight: bold;")
-        elif self.installed:
-            self.install_launch_button.setText("Launch")
-            self.status_label.setText("Ready for Launch")
-            self.status_label.setStyleSheet("color: #7ec8ff; font-weight: bold;")
-        else:
-            self.install_launch_button.setText("Install")
-            self.status_label.setText("Not Installed")
-            self.status_label.setStyleSheet("color: #7c92a6; font-weight: bold;")
-
-    def get_installed_version(self):  # 2 usages ± Mewada, Madhusudan
-        """Read the installed version from a version file in the installation directory"""
-        version_file = os.path.join(self.install_path, "version.txt")
-        if os.path.exists(version_file):
-            try:
-                with open(version_file, 'r') as f:
-                    return float(f.read().strip())
-            except:
-                return None
-        return None
-
-    def save_installed_version(self):  # 1 usage ± Mewada, Madhusudan
-        """Save the current version number to a file after installation"""
-        try:
-            os.makedirs(self.install_path, exist_ok=True)
-            version_file = os.path.join(self.install_path, "version.txt")
-            with open(version_file, 'w') as f:
-                f.write(str(self.version_number))
-        except Exception as e:
-            print(f"Error saving version info: {str(e)}")
-
-    def update_application(self):  # 1 usage ± Mewada, Madhusudan
-        """
-        method checks for the new version availability
-        :return:
-        """
-        latest_version = self.version_number
-        if latest_version:
-            try:
-                if os.path.exists(self.install_path):
-                    shutil.rmtree(self.install_path)
-
-                self.shared_drive_path = self.shared_drive_path
-                self.install_application()
-                self.version_number = latest_version
-                self.update_available = False
-                self.update_button_states()
-
-            except Exception as e:
-                QMessageBox.critical(self, "Update Error", f"Failed to update {self.app_name}: {str(e)}")
-
-    def create_button_layout(self):  # ± Mewada, Madhusudan
-        # Buttons layout for application tile
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(10)
-
-        self.install_launch_button = QPushButton("Install")
-        self.install_launch_button.clicked.connect(self.on_install_launch_clicked)
-        self.uninstall_button = QPushButton("Uninstall")
-        self.uninstall_button.setEnabled(True)
-        self.uninstall_button.clicked.connect(self.on_uninstall_clicked)
-
-        self.install_launch_button.setStyleSheet("""
-            QPushButton {
-                background-color: #00477b;
-                color: white;
-                border: none;
-                padding: 8px 2px;
-                border-radius: 5px;
-                font-weight: bold;
-                font-family: Montserrat, serif;
-            }
-            QPushButton:hover {
-                background-color: #2c70a9;
-            }
-        """)
-
-        self.uninstall_button.setStyleSheet("""
-            QPushButton {
-                background-color: #c5c9d0;
-                color: white;
-                border: none;
-                padding: 8px 2px;
-                border-radius: 5px;
-                font-weight: bold;
-                font-family: Montserrat, serif;
-            }
-            QPushButton:hover {
-                background-color: #d9de63;
-            }
-        """)
-
-        button_layout.addWidget(self.install_launch_button)
-        button_layout.addWidget(self.uninstall_button)
-        return button_layout
-
-    def setup_status_and_progress(self, layout):  # ± Mewada, Madhusudan
-        # Status label
-        self.status_label = QLabel("Not Installed")
-        self.status_label.setStyleSheet("""
-            color: #6c757d;
-            font-weight: bold;
-            margin-top: 5px;
-        """)
-        layout.addWidget(self.status_label, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #e0e0e0;
-                border-radius: 5px;
-                text-align: center;
-                background-color: #f8f9fa;
-                height: 10px;
-                font-family: Montserrat, serif;
-            }
-            QProgressBar::chunk {
-                background-color: #4a90e2;
-                border-radius: 5px;
-            }
-        """)
-        layout.addWidget(self.progress_bar)
-
-        # Add title hover effect
-        self.setStyleSheet("""
-            ApplicationTile {
-                background-color: white;
-                border-radius: 10px;
-                border: 1px solid #e0e0e0;
-            }
-            ApplicationTile:hover {
-                border: 1px solid #4a90e2;
-                box-shadow: 0 4px 8px rgba(74, 144, 226, 0.1);
-            }
-        """)
-
-        # Update initial button states
-        if self.is_app_installed(f'{self.install_path}.exe'):
-            self.installed = True
-            self.uninstall_button.setEnabled(True)
-            self.update_button_states()
-
-
-class NoAccessWidget(QWidget): # 2 usages ± Mewada, Madhusudan
-    def __init__(self, is_gfbm_user): # ± Mewada, Madhusudan
-        super().__init__()
-        layout = QVBoxLayout(self)
-
-        # Create a container for the message with styling
-        message_container = QFrame()
-        message_container.setObjectName("messageContainer")
-        message_container.setStyleSheet("""
-            #messageContainer {
-                background-color: #f8f9fa;
-                border-radius: 10px;
-                padding: 20px;
-                margin: 20px;
-                font-family: Montserrat, serif;
-            }
-        """)
-
-        container_layout = QVBoxLayout(message_container)
-
-        icon_label = QLabel()
-        icon_path = resource_path(f"resources/blocked.png")
-        icon_pixmap = QPixmap(icon_path)
-        if icon_pixmap.isNull():
-            # Fallback text if icon isn't found
-            icon_label.setText("⚠")
-            icon_label.setStyleSheet("""
-                QLabel {
-                    font-size: 48px;
-                    color: #6c757d;
-                }
-            """)
-        else:
-            icon_label.setPixmap(icon_pixmap.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio))
-        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        container_layout.addWidget(icon_label)
-
-        message_label = QLabel("No Application Access")
-        message_label.setStyleSheet("""
-            QLabel {
-                font-size: 24px;
-                font-weight: bold;
-                color: #343a40;
-                margin: 10px 0;
-                font-family: Montserrat, serif;
-            }
-        """)
-        message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        container_layout.addWidget(message_label)
-
-        description_label = QLabel(
-            "Currently, you do not have access to any application.\n"
-            "Please contact administrator for access permissions."
-        )
-        if not is_gfbm_user:
-            description_label = QLabel(
-                "Thanks for showing your interest for PSLV.\n"
-                "At present, Application is accessible for Global Finance & Business Management India."
-            )
-        description_label.setStyleSheet("""
-            QLabel {
-                font-size: 16px;
-                color: #6c757d;
-                margin: 10px 0;
-                font-family: Montserrat, serif;
-            }
-        """)
-        description_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        container_layout.addWidget(description_label)
-
-        # Add contact button
-        contact_button = QPushButton("Help Center!!!")
-        contact_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4a90e2;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 5px;
-                font-weight: bold;
-                max-width: 200px;
-                font-family: Montserrat, serif;
-            }
-            QPushButton:hover {
-                background-color: #357abd;
-            }
-        """)
-        contact_button.clicked.connect(self.contact_admin)
-        container_layout.addWidget(contact_button, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        # Add everything to the main layout
-        layout.addWidget(message_container, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addStretch()
-
-    def contact_admin(self): # 1 usage ± Mewada, Madhusudan
-        # Open a support link in the default browser
-        support_url = QUrl("https://confluence.prod.aws.jpmchase.net/confluence/spaces/GFITECH/pages/5228999093/APPLICATION+OWNER+AND+ADMINS")
-        QDesktopServices.openUrl(support_url)
-
-
-class MainWindow(QMainWindow): # 2 usages ± Mewada, Madhusudan
-    """
-    Main window class for pslv screen where all other components are merged
-    FIXED VERSION: Added proper threading for all blocking operations
-    """
-
-    def __init__(self, df, cost_center, userdata): # ± Mewada, Madhusudan
-        """
-        default class method to initialize all required ui elements for MainWindow widget of PSLV
-        :param df:
-        """
-        super().__init__()
-        self.all_tiles = []
-        self.access = df
-        self.cost_center_df = cost_center
-        self.userdata = userdata
-        
-        # Initialize worker threads
-        self.refresh_worker = None
-        self.admin_worker = None
-        self.user_details_worker = None
-        self.progress_dialog = None
-        
-        # Initialize user details and admin status
-        self.user_details = DETAILS  # Default fallback
-        self.cost_center = ""
-        self.is_gfbm_user = False
-        self.access_control_widget = QDialog()  # Default fallback
-        
-        # Set Windows username
-        self.username = user_main
-        self.setWindowTitle("PSLV by STD, GF&BM India")
-        icon_path = resource_path(f"resources/STDJustLogo.PNG")
-        self.setWindowIcon(QIcon(icon_path))
-        self.setFixedSize(1200, 720)  # fixed window size#f5f6fa;
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f2f4f6;
-                font-family: Montserrat, serif;
-            }
-        """)
-
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
+        main_layout = QHBoxLayout(self)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Setup UI components
-        self.setup_ui(main_layout)
-        
-        # Start loading user details and admin check in background
-        self.load_user_details_async()
-        self.check_admin_privileges_async()
+        # Left panel
+        left_panel = self.setup_left_panel()
+        main_layout.addWidget(left_panel)
 
-        # Load applications if data is available
-        if len(self.access) != 0:
-            self.load_applications()
-        else:
-            self.show_no_access_message()
+        # Right panel
+        self.right_stack = QStackedWidget(self)  # FIXED: Set proper parent
+        self.setup_right_panel()
+        main_layout.addWidget(self.right_stack)
 
-    def setup_ui(self, main_layout):
-        """Setup the main UI components"""
-        # Sidebar Widget starts here
-        sidebar = QWidget()
-        sidebar.setFixedWidth(250)  # Set fixed width for sidebar#2c3e50
-        sidebar.setStyleSheet("""
-            QWidget {
-                background-color: #242526;
-                color: white;
+        self.apply_styles()
+
+    def apply_styles(self):
+        self.setStyleSheet("""
+            QWidget#appContainer {
+                background-color: #f5f5f5;
+                border-right: 1px solid #e0e0e0;
+            }
+            QWidget#usersContainer {
+                background-color: white;
+            }
+            QScrollArea#usersScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QWidget#usersListContainer {
+                background-color: transparent;
+            }
+            QDialog {
+                background-color: #ffffff;
+            }
+            QPushButton {
+                border: none;
+                padding: 8px 16px;
+                color: #666;
+                text-align: left;
+                font-size: 13px;
+                border-radius: 4px;
+                margin: 2px 8px;
                 font-family: Montserrat, serif;
             }
-            QPushButton {
-                background-color: #6c5ce7;
-                color: white;
-                border: none;
-                padding: 10px;
-                margin: 10px 5px;
-                border-radius: 5px;
-            }
             QPushButton:hover {
-                background-color: #5b4bc7;
+                background-color: #f5f5f5;
+                color: #1976d2;
             }
-        """)
-        sidebar_layout = QVBoxLayout(sidebar)
-
-        # Logo
-        logo_label = QLabel()
-        logo_path = resource_path(f"resources/gfbm.svg")
-        logo_pixmap = QPixmap(logo_path)  # Replace with your logo path
-        logo_label.setPixmap(logo_pixmap.scaled(240, 240, Qt.AspectRatioMode.KeepAspectRatio,
-                                                Qt.TransformationMode.SmoothTransformation))
-        sidebar_layout.addWidget(logo_label, alignment=Qt.AlignmentFlag.AlignRight)
-        spacer = QSpacerItem(10, 50)
-        sidebar_layout.addItem(spacer)
-
-        # User details container (will be populated when data loads)
-        self.user_details_container = QWidget()
-        self.user_details_layout = QVBoxLayout(self.user_details_container)
-        sidebar_layout.addWidget(self.user_details_container)
-
-        sidebar_layout.addStretch()
-        
-        # Access control button (initially hidden)
-        self.access_control_button = QPushButton("Access Management")
-        self.access_control_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2670A9;
-                color: white;
-                border: none;
-                padding: 8px 2px;
-                border-radius: 5px;
+            QPushButton:checked {
+                background-color: #e3f2fd;
+                color: #1976d2;
                 font-weight: bold;
+                font-family: Montserrat, serif;
             }
-            QPushButton:hover {
-                background-color: #3380CD;
-            }
-        """)
-        self.access_control_button.setVisible(False)  # Hide initially
-        self.access_control_button.setCheckable(True)
-        sidebar_layout.addWidget(self.access_control_button)
-
-        exit_button = QPushButton("Exit")
-        exit_button.setStyleSheet("""
-            QPushButton {
-                background-color: #A6150B;
+            QPushButton#actionButton {
+                background-color: #1976d2;
                 color: white;
                 border: none;
-                padding: 8px 2px;
-                border-radius: 5px;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: 500;
+                min-width: 100px;
+                min-height: 20px;
+                text-align: center;
+                font-family: Montserrat, serif;
+            }
+            QPushButton#actionButton:hover {
+                background-color: #1565c0;
+            }
+            QLineEdit {
+                border: 1px solid #e0e0e0;
+                padding: 8px;
+                border-radius: 4px;
+                font-size: 13px;
+                min-height: 20px;
+                background: white;
+                font-family: Montserrat, serif;
+            }
+            QLineEdit:focus {
+                border: 1px solid #1976d2;
+            }
+            QLineEdit:hover {
+                border: 2px solid #bbdefb;
+            }
+            QFrame#leftPanel {
+                background-color: #fafafa;
+                border-right: 1px solid #e0e0e0;
+            }
+            QFrame#sidTag {
+                background-color: #f5f5f5;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 4px;
+                margin: 4px 0px;
+                min-height: 40px;
+            }
+            QFrame#sidTag:hover {
+                border-color: #bbdefb;
+                background-color: #f5f5f5;
+            }
+            QLabel {
+                color: #333;
+                font-size: 13px;
+                font-family: Montserrat, serif;
+                text-align: left;
+            }
+            QLabel[heading="true"] {
+                font-size: 15px;
                 font-weight: bold;
+                color: #1976d2;
+                padding: 16px;
+                font-family: Montserrat, serif;
+                text-align: left;
             }
-            QPushButton:hover {
-                background-color: #C42010;
+            QLabel[appheading="true"] {
+                font-size: 15px;
+                font-weight: bold;
+                color: #1976d2;
+                padding-bottom: 5px;
+                font-family: Montserrat, serif;
+                text-align: left;
             }
-        """)
-        exit_button.clicked.connect(self.close)
-        sidebar_layout.addWidget(exit_button)
+            QLabel[subheading="true"] {
+                font-size: 14px;
+                font-weight: 500;
+                color: #666;
+                padding-bottom: 5px;
+                font-family: Montserrat, serif;
+                text-align: left;
+            }
+            QFrame#appTile {
+                background-color: white;
+                border: 1px solid #e0e0e0;
+                border-radius: 5px;
+                margin: 4px 5px;
+            }
+            QFrame#appTile:hover {
+                background-color: #f2f5f5;
+                border: 1px solid #1976d2;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            }
+            QFrame#appTile[selected="true"] {
+                background-color: #e3f2fd;
+                border: 1px solid #1565c0;
+            }
+            QFrame#appTile[selected="true"]:hover {
+                background-color: #e3f2fd;
+                border: 1px solid #1565c0;
+            }
+            QLabel[appName="true"] {
+                font-size: 14px;
+                font-weight: bold;
+                color: #1976d2;
+                margin-bottom: 4px;
+                font-family: Montserrat, serif;
+            }
+            QLabel[appDescription="true"] {
+                font-size: 12px;
+                color: #666;
+                line-height: 1.4;
+                margin-top: 4px;
+                font-family: Montserrat, serif;
+            }
+            QLabel[appIcon="true"] {
+                font-size: 18px;
+                color: #1976d2;
+            }
+            QListWidget#application {
+                background-color: #f5f5f5;
+                border: none;
+                border-radius: 0px;
+                padding: 8px 4px;
+            }
+            QListWidget#application:item {
+                padding: 0px;
+                margin: 4px 0px;
+                border: none;
+            }
+            QListWidget#application:item:selected {
+                padding: 4px 2px;
+            }
+            QListWidget#application {
+                background-color: #f5f5f5;
+                border: blue;
+                border-radius: 5px;
+                padding: 4px 2px;
+            }
+            QScrollArea {
+                border: none;
+                background: white;
+            }
+            QComboBox {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 5px;
+                min-height: 20 px;
+                background: white;
+            }
+            QComboBox:disabled {
+                background: #f5f5f5;
+            }
+            QCheckBox {
+                spacing: 8px;
+                min-height: 36px;
+                padding: 4px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QLabel[fieldLabel="true"] {
+                font-weight: 500;
+                margin-bottom: 4px;
+            }
+            QLabel[required="true"]:after {
+                content: " *";
+                color: #f44336;
+            }
+            QPushButton#secondaryButton {
+                background-color: #f5f5f5;
+                color: #666;
+                border: 1px solid #e0e0e0;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: 500;
+                min-width: 100px;
+                min-height: 20px;
+                text-align: center;
+                font-family: Montserrat, serif;
+            }
+            QPushButton::secondaryButton:hover {
+                background-color: #e0e0e0;
+            }
+            """)
 
-        # Main content area
-        content_area = QWidget()
-        content_layout = QVBoxLayout(content_area)
+    def setup_left_panel(self):
+        # left panel QFrame element
+        left_panel = QFrame(self)  # FIXED: Set proper parent
+        left_panel.setObjectName("leftPanel")
+        left_panel.setFixedWidth(220)
+        layout = QVBoxLayout(left_panel)
+        layout.setSpacing(4)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # Logo
-        logo_label = QLabel()
-        logo_path = resource_path(f"resources/Full Logo.svg")
-        logo_pixmap = QPixmap(logo_path)  # Replace with your logo path
-        logo_label.setPixmap(logo_pixmap.scaled(240, 240, Qt.AspectRatioMode.KeepAspectRatio,
-                                                Qt.TransformationMode.SmoothTransformation))
-        content_layout.addWidget(logo_label, alignment=Qt.AlignmentFlag.AlignRight)
+        title = QLabel("Access Controls", left_panel)  # FIXED: Set proper parent
+        title.setProperty("heading", True)
+        layout.addWidget(title)
 
-        # Applications title and search bar
-        self.header_widget = QWidget()
-        self.header_layout = QVBoxLayout(self.header_widget)
+        # Navigation with icons (you can replace with actual icons)
+        self.add_app_btn = QPushButton("⊞ Add Application", left_panel)  # FIXED: Set proper parent
+        self.manage_access_btn = QPushButton("⚙ Manage Access", left_panel)  # FIXED: Set proper parent
 
-        # Create a custom widget for the search bar with icons
-        self.search_widget = QWidget()
-        self.search_layout = QHBoxLayout(self.search_widget)
-        self.search_layout.setContentsMargins(15, 0, 15, 0)
-        self.search_layout.setSpacing(10)
-        # Search input
-        self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("🔍 Search applications...")
-        self.search_bar.textChanged.connect(self.filter_applications)
-        self.search_bar.setStyleSheet("""
-                    QLineEdit {
-                        border: none;
-                        padding: 12px 0px;
-                        font-size: 14px;
-                        background-color: transparent;
-                    }
-                    QLineEdit:focus {
-                        outline: none;
-                    }
-                """)
+        self.add_app_btn.setCheckable(True)
+        self.manage_access_btn.setCheckable(True)
 
-        # Refresh button
-        refresh_button = QPushButton("⟲")
-        refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_button.setToolTip("⟲ Refresh Applications")
-        refresh_button.clicked.connect(self.refresh_applications_async)  # FIXED: Use async version
-        refresh_button.setStyleSheet("""
-                    QPushButton {
-                        background-color: transparent;
-                        border: none;
-                        color: #000000;
-                        font-size: 20px;
-                        padding: 5px;
-                        min-width: 30px;
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        color: #4a90e2;
-                    }
-                """)
+        layout.addWidget(self.add_app_btn)
+        layout.addWidget(self.manage_access_btn)
+        layout.addStretch()
 
-        # Add widgets to search layout
-        self.search_layout.addWidget(self.search_bar)  # 1 is the stretch factor
-        self.search_layout.addWidget(refresh_button)
+        self.add_app_btn.clicked.connect(lambda: self.switch_panel(0))
+        self.manage_access_btn.clicked.connect(lambda: self.switch_panel(1))
 
-        # Style the search widget container
-        self.search_widget.setStyleSheet("""
-                    QWidget {
-                        border: 1px solid #ddd;
-                        border-radius: 20px;
-                        padding: 10px 15px;
-                        font-size: 16px;
-                        margin-bottom: 10px;
-                        background-color: white;
-                    }
-                    QWidget:focus-within {
-                        border-color: #4a90e2;
-                        outline: none;
-                    }
-                """)
+        return left_panel
 
-        # Scroll area for application grid or no access message
-        scroll_area = QScrollArea()
+    def fetch_user_name(self, sid):
+        if len(sid.strip()) != 7:
+            return
+        try:
+            data = awmpy.get_phonebook_data(sid)
+            self.add_app_fields['Developed_By'].setText(data['nameFull'])
+        except Exception as e:
+            self.add_app_fields['Developed_By'].clear()
+
+    def eventFilter(self, obj, event):
+        if event.type() == event.Type.Wheel:
+            if not obj.hasFocus():
+                return True
+        return super().eventFilter(obj, event)
+
+    def app_filled_widget(self, fields):
+        # Method which populates the details of application in widgets
+        field_name, label_text, placeholder, options, field_type, validation_type, required = fields
+        field_layout = QVBoxLayout()
+        field_layout.setSpacing(6)
+
+        # label = QLabel(label_text)
+        label = QLabel(label_text + (" *" if required else ""))
+        label.setProperty("fieldLabel", True)
+        if field_type == "dropdown":
+            field = QComboBox(self)  # FIXED: Set proper parent
+            field.setPlaceholderText(placeholder)
+            if field_name == "LoB":
+                options = self.lob
+            field.addItems(options)
+            field.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            field.setStyleSheet("""
+                            QComboBox:item {
+                                color: black;
+                            }
+                            QComboBox:placeholder {
+                                color: #bcbcbc;
+                            }
+                            QComboBox {
+                                border: 1px solid #e0e0e0;
+                                padding: 8px;
+                                border-radius: 4px;
+                                font-size: 13px;
+                                min-height: 20px;
+                                background: white;
+                                font-family: Montserrat, serif;
+                                color: grey;
+                            }
+                            QComboBox:focus {
+                                border: 1px solid #1976d2;
+                            }
+                            QComboBox:hover {
+                                border: 1px solid #1976d2;
+                            }
+                            """)
+            field.installEventFilter(self)
+        else:
+            field = ValidatingLineEdit(validation_type, required, parent=self)  # FIXED: Set proper parent
+            field.setPlaceholderText(placeholder)
+            field.setProperty("formInput", True)
+            if field_name == "Developed_By":
+                field.textChanged.connect(self.fetch_user_name)
+
+        self.add_app_fields[field_name] = field
+        field_layout.addWidget(label)
+        field_layout.addWidget(field)
+        return field_layout
+
+    def setup_right_panel(self):
+        # Add Application Panel
+        add_update_widget = QWidget(self)  # FIXED: Set proper parent
+        main_layout = QVBoxLayout(add_update_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Create fixed header section
+        header_widget = QWidget(add_update_widget)  # FIXED: Set proper parent
+        header_layout = QVBoxLayout(header_widget)
+        header_layout.setContentsMargins(30, 0, 30, 10)
+        header_layout.setSpacing(10)
+
+        # Title section
+        title = QLabel("Application Details", header_widget)  # FIXED: Set proper parent
+        title.setProperty("appheading", True)
+        header_layout.addWidget(title)
+
+        description = QLabel("Enter the application details below.", header_widget)  # FIXED: Set proper parent
+        description.setProperty("subheading", True)
+        header_layout.addWidget(description)
+
+        # Application selection for update mode
+        select_layout = QHBoxLayout()
+        select_layout.setSpacing(10)
+        self.update_mode_checkbox = QCheckBox("Update Existing Application", header_widget)  # FIXED: Set proper parent
+        self.app_select_combo = QComboBox(header_widget)  # FIXED: Set proper parent
+        self.app_select_combo.setMinimumWidth(400)
+        self.app_select_combo.setEnabled(False)
+        # Customize the QComboBox appearance using stylesheets
+        self.app_select_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #f0f0f0;
+                border: 1px solid #888;
+                border-radius: 5px;
+                padding: 5px;
+                font-size: 14px;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox::indicator {
+                width: 20px;
+                height: 20px;
+            }
+            QComboBox::item {
+                padding: 5px;
+            }
+            QComboBox::item:selected {
+                background-color: #007847;
+                color: white;
+            }
+            """)
+
+        select_layout.addWidget(self.update_mode_checkbox)
+        select_layout.addWidget(self.app_select_combo)
+        select_layout.addStretch()
+        header_layout.addLayout(select_layout)
+
+        # Add header to main layout
+        main_layout.addWidget(header_widget)
+
+        # Create a scroll area for the form
+        scroll_area = QScrollArea(add_update_widget)  # FIXED: Set proper parent
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll_area.setStyleSheet("""
-                    QScrollArea {
-                        border: none;
-                        background-color: transparent;
-                    }
-                    QScrollBar:vertical {
-                        border: none;
-                        background: #f0f0f0;
-                        width: 8px;
-                        border-radius: 4px;
-                    }
-                    QScrollBar::handle:vertical {
-                        background: #c0c0c0;
-                        border-radius: 4px;
-                    }
-                    QScrollBar::handle:vertical:hover {
-                        background: #a0a0a0;
-                    }
-                """)
-        scroll_content = QWidget()
-        self.app_grid = QGridLayout(scroll_content)
-        self.app_grid.setSpacing(20)
-        scroll_area.setWidget(scroll_content)
 
-        self.search_app = QWidget()
-        self.search_app_layout = QVBoxLayout(self.search_app)
-        self.search_app_layout.addWidget(self.header_widget)
-        self.search_app_layout.addWidget(scroll_area)
+        # Create container widget for the form
+        form_container = QWidget(scroll_area)  # FIXED: Set proper parent
+        add_layout = QVBoxLayout(form_container)
+        add_layout.setContentsMargins(30, 20, 30, 20)
+        add_layout.setSpacing(10)
 
-        # Connect buttons to switch views
-        self.access_control_button.clicked.connect(self.show_access_control)
+        self.add_app_fields = {}
+        for field in FIELDS:
+            add_layout.addLayout(self.app_filled_widget(field))
 
-        # Create stacked widget to switch between applications and access control
-        self.stacked_widget = QStackedWidget()
+        # Button section
+        button_layout = QHBoxLayout()
+        self.save_btn = QPushButton("Save", form_container)  # FIXED: Set proper parent
+        self.save_btn.setObjectName("actionButton")
+        self.save_btn.setFixedWidth(140)
 
-        # Add widgets to stacked widget
-        self.stacked_widget.addWidget(self.search_app)
-        # Access control widget will be added when admin check completes
+        self.clear_btn = QPushButton("Clear Form", form_container)  # FIXED: Set proper parent
+        self.clear_btn.setObjectName("secondaryButton")
+        self.clear_btn.setFixedWidth(140)
 
-        main_layout.addWidget(sidebar)
-        content_layout.addWidget(self.stacked_widget, stretch=1)
-        main_layout.addWidget(content_area)
-        self.stacked_widget.setCurrentIndex(0)
+        button_layout.addStretch()
+        button_layout.addWidget(self.clear_btn)
+        button_layout.addWidget(self.save_btn)
 
-        # Add footer container
-        footer_container = QWidget()
-        footer_layout = QHBoxLayout(footer_container)
-        footer_layout.setContentsMargins(0, 2, 0, 0)
+        add_layout.addLayout(button_layout)
+        add_layout.addStretch()
 
-        # Add version label
-        version_label = QLabel("PSLV by STO v3.0")
-        version_label.setStyleSheet("""
-                    QLabel {
-                        color: #595858;
-                        font-size: 11px;
-                        font-style: italic;
-                    }
-                """)
+        # Set the form container as the scroll area widget
+        scroll_area.setWidget(form_container)
+        main_layout.addWidget(scroll_area)
 
-        # Add spacer to push version label to the right
-        footer_layout.addStretch()
-        footer_layout.addWidget(version_label)
+        # Connect signals
+        self.update_mode_checkbox.toggled.connect(self.toggle_update_mode)
+        self.app_select_combo.currentTextChanged.connect(self.load_application_data)
+        self.save_btn.clicked.connect(self.save_application)
+        self.clear_btn.clicked.connect(self.clear_form)
 
-        # Add footer to main layout
-        content_layout.addWidget(footer_container)
+        # Manage Access Panel
+        manage_widget = QWidget(self)  # FIXED: Set proper parent
+        manage_layout = QVBoxLayout(manage_widget)
+        manage_layout.setContentsMargins(0, 0, 0, 0)
+        manage_layout.setSpacing(0)
 
-    def show_progress_dialog(self, message):
-        """Show progress dialog for long-running operations"""
-        if self.progress_dialog is None:
-            self.progress_dialog = QProgressDialog(message, "Cancel", 0, 0, self)
-            self.progress_dialog.setWindowTitle("Loading...")
-            self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-            self.progress_dialog.setMinimumDuration(0)
-            self.progress_dialog.canceled.connect(self.cancel_operations)
-        else:
-            self.progress_dialog.setLabelText(message)
-        
-        self.progress_dialog.show()
+        # Apps list with tiles
+        apps_container = QWidget(manage_widget)  # FIXED: Set proper parent
+        apps_container.setObjectName("appsContainer")
+        apps_layout = QVBoxLayout(apps_container)
+        apps_layout.setContentsMargins(10, 0, 20, 20)
 
-    def hide_progress_dialog(self):
-        """Hide progress dialog"""
-        if self.progress_dialog:
-            self.progress_dialog.hide()
+        apps_title = QLabel("Applications", apps_container)  # FIXED: Set proper parent
+        apps_title.setProperty("appheading", True)
 
-    def cancel_operations(self):
-        """Cancel running operations"""
-        if self.refresh_worker and self.refresh_worker.isRunning():
-            self.refresh_worker.stop()
-            self.refresh_worker.quit()
-            self.refresh_worker.wait(3000)
-        
-        if self.admin_worker and self.admin_worker.isRunning():
-            self.admin_worker.quit()
-            self.admin_worker.wait(3000)
-            
-        if self.user_details_worker and self.user_details_worker.isRunning():
-            self.user_details_worker.quit()
-            self.user_details_worker.wait(3000)
+        self.app_list = QListWidget(apps_container)  # FIXED: Set proper parent
+        self.app_list.setObjectName("application")
+        # self.app_list.setSpacing(10)
+        self.app_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.app_list.setViewMode(QListWidget.ViewMode.ListMode)
+        self.app_list.setMinimumWidth(350)
+        self.app_list.setUniformItemSizes(True)
+        # self.app_list.setFixedHeight(app_list())
 
-    def load_user_details_async(self):
-        """FIXED: Load user details in background thread"""
-        self.user_details_worker = UserDetailsWorker(self.userdata)
-        self.user_details_worker.user_details_loaded.connect(self.on_user_details_loaded)
-        self.user_details_worker.error_occurred.connect(self.on_user_details_error)
-        self.user_details_worker.start()
+        apps_layout.addWidget(apps_title)
+        apps_layout.addWidget(self.app_list)
 
-    def on_user_details_loaded(self, details, cost_center):
-        """Handle user details loaded"""
-        self.user_details = details
-        self.cost_center = cost_center
-        
-        # Update UI with user details
-        self.update_user_details_ui()
-        
-        # Check if user is GFBM user
-        self.check_gfbm_user()
+        # Users section
+        users_container = QWidget(manage_widget)  # FIXED: Set proper parent
+        users_container.setObjectName("usersContainer")
 
-    def on_user_details_error(self, error_message):
-        """Handle user details loading error"""
-        print(f"Warning: {error_message}")
-        # Use default details
-        self.update_user_details_ui()
+        self.setup_user_management(users_container)
+        manage_layout.addWidget(apps_container, 1)
+        manage_layout.addWidget(users_container, 2)
 
-    def update_user_details_ui(self):
-        """Update the UI with loaded user details"""
-        # Clear existing details
-        for i in reversed(range(self.user_details_layout.count())):
-            self.user_details_layout.itemAt(i).widget().setParent(None)
-        
-        # Add new details
-        for label, icon_name in self.user_details:
-            detail_widget = self.create_detail_widget(label, icon_name)
-            self.user_details_layout.addWidget(detail_widget)
+        self.right_stack.addWidget(add_update_widget)
+        self.right_stack.addWidget(manage_widget)
 
-    def check_admin_privileges_async(self):
-        """FIXED: Check administrator privileges in background thread"""
-        self.admin_worker = AdminCheckWorker()
-        self.admin_worker.admin_check_complete.connect(self.on_admin_check_complete)
-        self.admin_worker.error_occurred.connect(self.on_admin_check_error)
-        self.admin_worker.start()
+    def update_app_list(self):
+        self.app_list.clear()
+        if hasattr(self, 'df') and not self.df.empty:
+            for _, row in self.df.iterrows():
+                item = QListWidgetItem(self.app_list)
+                # FIXED: Ensure AppTileWidget has proper parent reference
+                tile_widget = AppTileWidget(row['Solution_Name'], row['Description'], parent=self.app_list)
+                tile_widget.setFrameShape(QFrame.Shape.StyledPanel)
+                # tile_widget.setFixedHeight(QWidget.sizeHint())
+                item.setSizeHint(QSize(300, 100))
+                item.setData(Qt.ItemDataRole.UserRole, row['Solution_Name'])
+                self.app_list.setItemWidget(item, tile_widget)
 
-    def on_admin_check_complete(self, is_admin, managed_lob):
-        """Handle admin check completion"""
-        if is_admin:
-            # Create access control widget
-            self.access_control_widget = AccessControlDialog(self.username, managed_lob)
-            self.stacked_widget.addWidget(self.access_control_widget)
-            
-            # Show access control button
-            self.access_control_button.setVisible(True)
+        self.app_list.itemSelectionChanged.connect(self.handle_selection_changed)
 
-    def on_admin_check_error(self, error_message):
-        """Handle admin check error"""
-        print(f"Warning: {error_message}")
-        # Keep button hidden and use default dialog
+    def handle_selection_changed(self):
+        # Update all tiles to unselected state first
+        for i in range(self.app_list.count()):
+            item = self.app_list.item(i)
+            tile_widget = self.app_list.itemWidget(item)
+            tile_widget.set_selected(False)
 
-    def refresh_applications_async(self):
-        """FIXED: Refresh applications in background thread"""
-        if self.refresh_worker and self.refresh_worker.isRunning():
-            return  # Already refreshing
-        
-        self.show_progress_dialog("Refreshing applications...")
-        self.search_bar.clear()
-        
-        self.refresh_worker = RefreshWorker()
-        self.refresh_worker.data_loaded.connect(self.on_refresh_complete)
-        self.refresh_worker.error_occurred.connect(self.on_refresh_error)
-        self.refresh_worker.progress_updated.connect(self.update_progress_message)
-        self.refresh_worker.start()
+        # Set the selected state for the current item
+        current_item = self.app_list.currentItem()
+        if current_item:
+            tile_widget = self.app_list.itemWidget(current_item)
+            tile_widget.set_selected(True)
 
-    def on_refresh_complete(self, processed_df):
-        """Handle refresh completion"""
-        self.hide_progress_dialog()
-        self.access = processed_df
-        
-        if len(self.access) > 0:
-            self.load_applications()
-            QMessageBox.information(self, "Application", "Refresh Complete...", QMessageBox.StandardButton.Ok)
-        else:
-            self.show_no_access_message()
+    def show_success_message(self, message):
+        # FIXED: Ensure message box has proper parent reference
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(message)
+        msg.setWindowTitle("Success")
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: white;
+            }
+            QMessageBox QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: 500;
+                min-width: 100px;
+                min-height: 20px;
+                text-align: center;
+                font-family: Montserrat, serif;
+            }
+            QMessageBox QPushButton:hover {
+                background-color: #1565c0;
+            }
+            """)
+        msg.exec()
 
-    def on_refresh_error(self, error_message):
-        """Handle refresh error"""
-        self.hide_progress_dialog()
-        QMessageBox.warning(self, "Refresh Error", error_message, QMessageBox.StandardButton.Ok)
+    def switch_panel(self, index):
+        self.add_app_btn.setChecked(index == 0)
+        self.manage_access_btn.setChecked(index == 1)
+        self.right_stack.setCurrentIndex(index)
 
-    def update_progress_message(self, message):
-        """Update progress dialog message"""
-        if self.progress_dialog:
-            self.progress_dialog.setLabelText(message)
+    def save_application(self):
+        # Validate all fields
+        all_valid = True
+        for field_name, input_widget in self.add_app_fields.items():
+            if isinstance(input_widget, ValidatingLineEdit):
+                if not input_widget.validate():
+                    all_valid = False
 
-    def show_no_access_message(self):
-        """Show no access message"""
-        self.clear_layout(self.app_grid)
-        self.app_grid.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignTop)
-        self.app_grid.addWidget(NoAccessWidget(self.is_gfbm_user))
-
-    def check_gfbm_user(self):
-        """Check if user is GFBM user"""
-        if not self.cost_center_df.empty and self.cost_center:
-            self.cost_center_df['cost_center_code'] = self.cost_center_df['cost_center_code'].astype(str)
-            cc_column = self.cost_center_df['cost_center_code'].to_list()
-            self.is_gfbm_user = self.cost_center in cc_column
-        else:
-            self.is_gfbm_user = False
-
-    def show_access_control(self):
-        """
-        This method mainly controls UI element switch between applications and access control
-        :return:
-        """
-        if self.stacked_widget.currentIndex() == 1:
-            self.stacked_widget.setCurrentIndex(0)
-            self.access_control_button.setText("Access Management")
-            self.access_control_button.setStyleSheet("""
-                        QPushButton {
-                            background-color: #2670A9;
-                            color: white;
-                            border: none;
-                            padding: 8px 2px;
-                            border-radius: 5px;
-                            font-weight: bold;
-                        }
-                        QPushButton:hover {
-                            background-color: #3380CD;
-                        }
-                    """)
-        elif self.stacked_widget.currentIndex() == 0:
-            self.stacked_widget.setCurrentIndex(1)
-            self.access_control_button.setText("Applications")
-            self.access_control_button.setStyleSheet("""
-                        QPushButton {
-                            background-color: #49A0AC;
-                            color: white;
-                            border: none;
-                            padding: 8px 2px;
-                            border-radius: 5px;
-                            font-weight: bold;
-                        }
-                        QPushButton:hover {
-                            background-color: #49A0AC;
-                        }
-                    """)
-
-    def create_detail_widget(self, value, icon_name):  # 1 usage = Mewada, Madhusudan
-        """
-        class method for creating combined similar ui objects for user details population based on the data coming
-        from details
-        :param value: string
-        :param icon_name: string
-        :return:
-        """
-        widget = QFrame()
-        widget.setStyleSheet("QFrame { padding: 2px; }")
-
-        layout = QHBoxLayout(widget)
-        layout.setSpacing(5)
-        layout.setContentsMargins(2, 2, 2, 2)
-
-        icon_label = QLabel()
-        icon_path = resource_path(f"resources/{icon_name}")
-        icon = QIcon(icon_path)
-        icon_label.setPixmap(icon.pixmap(25, 25))
-        layout.addWidget(icon_label)
-
-        text_layout = QVBoxLayout()
-        text_layout.setSpacing(0)
-
-        text_label = QLabel(value)
-        text_label.setFont(QFont('Helvetica', 10, QFont.Weight.DemiBold))
-        text_label.setWordWrap(True)
-        text_layout.addWidget(text_label)
-
-        layout.addLayout(text_layout)
-        layout.addStretch()
-        layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        return widget
-
-    def load_applications(self):  # 2 usages = Mewada, Madhusudan
-        """
-        the main cause method which list down the accessible application for the user
-        :return:
-        """
-        try:
-            self.clear_layout(self.app_grid)  # clear the space for Application files
-            self.app_grid.setContentsMargins(10, 10, 10, 10)  # Add right margin to prevent cutoff
-
-            if len(self.access) > 0:
-                self.app_grid.setContentsMargins(10, 10, 10, 3)  # Add right margin to prevent cutoff
-
-            self.app_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)  # Align to top-left
-            self.all_tiles.clear()
-            self.access['Expired'] = self.access.apply(lambda row: expire_sort(row), axis=1)
-            self.access = self.access.sort_values(by=['Expired', 'Solution_Name'], ascending=[True, True])
-            self.access.reset_index(inplace=True, drop=True)
-
-            # loop over the list of available solution and create Application title
-            for i, row in self.access.iterrows():
-                title = ApplicationTile(
-                    app_name=row['Solution_Name'],
-                    app_description=row['Description'],
-                    shared_drive_path=row['ApplicationExePath'],
-                    environment=row['Status'],
-                    release_date=row['Release_Date'],
-                    validity_period=row['Validity_Period'],
-                    version_number=float(row['Version_Number']) if row['Version_Number'] else 1.0,
-                    registration_id=row['UMAT_IAHub_ID']
-                )
-                self.all_tiles.append(title)  # Store the tile reference
-
-            # Initial layout of all tiles
-            self.update_grid_layout("")
-        except Exception as e:
-            # You might want to show an error message to the user
-            QMessageBox.critical(self, "Error", f"Failed to load applications: {str(e)}")
-
-    def filter_applications(self, text):  # 1 usage = Mewada, Madhusudan
-        self.update_grid_layout(text.lower())
-
-    def update_grid_layout(self, filter_text):  # 2 usages = Mewada, Madhusudan
-        # Clear the current layout
-        self.clear_layout(self.app_grid)
-
-        # Filter and layout visible tiles
-        visible_tiles = [
-            tile for tile in self.all_tiles
-            if filter_text in tile.app_name.lower()
-        ]
-
-        # Add filtered tiles to the grid
-        for i, title in enumerate(visible_tiles):
-            row = i // 3  # 3 files per row
-            col = i % 3
-            self.app_grid.addWidget(title, row, col)
-            title.setVisible(True)
-
-        # Add stretch to bottom of grid to maintain alignment
-        self.app_grid.setRowStretch(len(visible_tiles) // 3 + 1, stretch=1)
-
-        self.adjust_layout_tiles(self.app_grid)
-
-    def adjust_layout_tiles(self, layout):  # 1 usage = Mewada, Madhusudan
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-            if item and isinstance(item.widget(), ApplicationTile):
-                item.widget()
-
-    def clear_layout(self, layout):  # 3 usages = Mewada, Madhusudan
-        if layout is None:
+        if not all_valid:
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(
+                self,
+                "Validation Error",
+                "Please check the form for errors:\n\n" +
+                "• Required fields must not be empty\n" +
+                "• Dates must be in DD-MM-YYYY format\n" +
+                "• Executable Path must contain application name with format\n" +
+                "• Version must be a valid number",
+                QMessageBox.StandardButton.Ok
+            )
             return
-        while layout.count():
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)  # Remove widget
 
-    def closeEvent(self, event):
-        """Handle window close event - cleanup threads"""
-        self.cancel_operations()
-        event.accept()
+        is_update_mode = self.update_mode_checkbox.isChecked()
+
+        # Collect form data
+        new_data = {}
+        for field, widget in self.add_app_fields.items():
+            if isinstance(widget, ValidatingLineEdit):  # QLineEdit for text fields
+                new_data[field] = widget.text()
+            elif isinstance(widget, QComboBox):  # QComboBox for dropdown fields
+                new_data[field] = widget.currentText()
+            else:
+                raise TypeError(f"Unsupported widget type for field '{field}'")
+
+        if not new_data["Solution_Name"]:
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(self, "Required Field",
+                                "Application Name is required.",
+                                QMessageBox.StandardButton.Ok)
+            return
+
+        try:
+            if is_update_mode:
+                # Update existing application
+                pslv_action_entry([{'SID':user_main, 'action':f'Updated details for app {self.app_name}'}])
+                app_name = self.app_select_combo.currentText()
+                idx = self.df[self.df['Solution_Name'] == app_name].index[0]
+                for field, value in new_data.items():
+                    if field in self.df.columns:
+                        self.df.at[idx, field] = value
+                data_dictionary = self.df.iloc[idx].to_dict()
+                self.update_sharepoint_db(dictionary_as_list=[data_dictionary], operation='Update')
+            else:
+                # Add new application
+                pslv_action_entry([{'SID':user_main, 'action':f'New App Registration done: {self.app_name}'}])
+                self.df = pd.concat([self.df, pd.DataFrame([new_data])], ignore_index=True)
+                self.update_sharepoint_db(dictionary_as_list=[new_data], operation='New')
+            # Show loading dialog
+            self.show_loading_dialog()
+            # Schedule data refresh after a short delay
+            QTimer.singleShot(500, self.handle_refresh)
+        except:
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(self, "Processing Failed",
+                                f"Failed to register solution [{new_data['Solution_Name']}].",
+                                QMessageBox.StandardButton.Ok)
+
+    def handle_refresh(self):
+        """Handle the data refresh and UI updates"""
+        if self.refresh_data():
+            # Update UI components
+            self.update_app_list()
+            self.clear_form()
+            # Close the progress dialog
+            if self.progress_dialog:
+                self.progress_dialog.close()
+
+            # Show success message
+            action = "updated" if self.update_mode_checkbox.isChecked() else "added"
+            self.show_success_message(f"Application has been {action} successfully!")
+        else:
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(self, "Refresh Failed",
+                                "Failed to refresh data. Please try again.",
+                                QMessageBox.StandardButton.Ok)
+
+    def update_sharepoint_db(self, dictionary_as_list, operation):
+        cred = HttpNtlmAuth(SID, "")
+        site = Site(SITE_URL, auth=cred, verify_ssl=False)
+
+        # Fetch data from SharePoint list
+        sp_list = site.list(SHAREPOINT_LIST)
+        sp_list.UpdateListItems(data=dictionary_as_list, kind=operation)
+
+    def toggle_update_mode(self):
+        """
+        Method created to handle toggle between Add or Update mode
+        :return:
+        """
+        is_update_mode = self.update_mode_checkbox.isChecked()
+        self.app_select_combo.setEnabled(is_update_mode)
+        self.add_app_fields["Solution_Name"].setEnabled(not is_update_mode)
+
+        if is_update_mode:
+            # Populate combo box with application names
+            self.app_select_combo.clear()
+            self.app_select_combo.addItems(self.df['Solution_Name'].tolist())
+            self.save_btn.setText("Update")
+        else:
+            self.clear_form()
+            self.save_btn.setText("Save")
+
+    def load_application_data(self, app_name):
+        """
+        Methods loads data to form for selected application
+        :param app_name:
+        :return:
+        """
+        if not app_name or not self.update_mode_checkbox.isChecked():
+            return
+
+        app_data = self.df[self.df['Solution_Name'] == app_name].iloc[0]
+        for field_name, input_widget in self.add_app_fields.items():
+            if field_name in app_data and field_name not in ['LoB', 'Status']:
+                input_widget.setText(str(app_data[field_name]))
+            elif field_name in ['LoB', 'Status']:
+                value = app_data.get(field_name)
+                index = input_widget.findText(value)
+                if index >= 0:
+                    input_widget.setCurrentIndex(index)
+
+    def clear_form(self):
+        """
+        method clear the all form field
+        :return:
+        """
+        for field_name, input_widget in self.add_app_fields.items():
+            input_widget.clear()
+            if field_name == "LoB":
+                options = self.lob.tolist()
+                input_widget.addItems(options)
+            elif field_name == 'Status':
+                input_widget.addItems(STATUS)
+        self.update_mode_checkbox.setChecked(False)
+
+    def setup_user_management(self, users_container):
+        """
+        A layout method for users management for the access control
+        :param users_container:
+        :return:
+        """
+        users_layout = QVBoxLayout(users_container)
+        users_layout.setContentsMargins(20, 0, 20, 20)
+
+        # Title
+        users_title = QLabel("Manage Users", users_container)  # FIXED: Set proper parent
+        users_title.setProperty("appheading", True)
+        users_layout.addWidget(users_title)
+
+        # Tab widget
+        tab_widget = QTabWidget(users_container)  # FIXED: Set proper parent
+        tab_widget.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                background: #eef0f0;
+            }
+            QTabBar::tab {
+                background: #f5f5f5;
+                border: 1px solid #e0e0e0;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #a5d4fa;
+                border-bottom-color: #a5d4fa;
+            }
+            """)
+
+        # Existing Users Tab
+        existing_users_tab = QWidget(tab_widget)  # FIXED: Set proper parent
+        existing_layout = QVBoxLayout(existing_users_tab)
+
+        existing_label = QLabel("Select users to remove access:", existing_users_tab)  # FIXED: Set proper parent
+        existing_label.setProperty("subheading", True)
+        existing_layout.addWidget(existing_label)
+
+        self.existing_users_list = QListWidget(existing_users_tab)  # FIXED: Set proper parent
+        self.existing_users_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.existing_users_list.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 5px;
+                background: white;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #f0f0f0;
+            }
+            QListWidget::item:selected {
+                background: #e3f2fd;
+                color: #1976d2;
+            }
+            """)
+        existing_layout.addWidget(self.existing_users_list)
+        remove_btn = QPushButton("Remove Selected Users", existing_users_tab)  # FIXED: Set proper parent
+        remove_btn.setObjectName("actionButton")
+        remove_btn.clicked.connect(self.remove_selected_users)
+        existing_layout.addWidget(remove_btn)
+
+        # Add Users Tab
+        add_users_tab = QWidget(tab_widget)  # FIXED: Set proper parent
+        add_layout = QVBoxLayout(add_users_tab)
+
+        add_label = QLabel("Enter user SIDs (one per line):", add_users_tab)  # FIXED: Set proper parent
+        add_label.setProperty("subheading", True)
+        add_layout.addWidget(add_label)
+
+        self.new_users_text = QTextEdit(add_users_tab)  # FIXED: Set proper parent
+        self.new_users_text.setPlaceholderText("Paste multiple IDs or enter one per line")
+        self.new_users_text.setStyleSheet("""
+            QTextEdit {
+                border: 1px solid #c0c0c0;
+                border-radius: 4px;
+                padding: 8px;
+                background: white;
+            }
+        """)
+        add_layout.addWidget(self.new_users_text)
+
+        add_btn = QPushButton("Add Users", add_users_tab)  # FIXED: Set proper parent
+        add_btn.setObjectName("actionButton")
+        add_btn.clicked.connect(self.add_multiple_users)
+        add_layout.addWidget(add_btn)
+
+        # Add tabs to widget
+        tab_widget.addTab(existing_users_tab, "Existing Users")
+        tab_widget.addTab(add_users_tab, "Add Users")
+        users_layout.addWidget(tab_widget)
+
+        def show_application_users(self, current_item):
+            if not current_item:
+                return
+
+            self.existing_users_list.clear()
+            app_name = current_item.data(Qt.ItemDataRole.UserRole)
+            app_data = self.df[self.df['Solution_Name'] == app_name].iloc[0]
+            users = split_user(app_data['SIDs_For_SolutionAccess'])
+
+            for user in users:
+                if user.strip():
+                    self.existing_users_list.addItem(user.strip())
+
+            # Ensure the item stays selected
+            self.app_list.setCurrentItem(current_item)
+            self.current_app_item = current_item
+
+    def remove_selected_users(self):
+        """
+        Method implements the functionality for removing the selected users from the selected solution
+        :return:
+        """
+
+        # check if any one solution tile is selected or not, if not selected throws warning box
+        if not self.app_list.currentItem():
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(self, "No Application Selected",
+                                "Please select an application first.",
+                                QMessageBox.StandardButton.Ok)
+            return
+
+        # read the users SID from the solution list
+        selected_items = self.existing_users_list.selectedItems()
+        if not selected_items:
+            return
+
+        # read the selected users SID from the list widget :(
+        users_to_remove = [item.text() for item in selected_items]
+        app_name = self.app_list.currentItem().data(Qt.ItemDataRole.UserRole)
+
+        # Confirmation message before removing the user SIDs
+        reply = QMessageBox.question(self, "Confirm Removal",
+                                     f"Are you sure you want to remove {len(users_to_remove)} user(s)?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        # check for the user confirmation for removal of user SIDs
+        if reply == QMessageBox.StandardButton.Yes:
+            # Create progress dialog - FIXED: Ensure proper parent reference
+            self.progress = QProgressDialog("Removing user IDs...", None, 0, 0, self)
+            self.progress.setWindowTitle("Please Wait")
+            self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+            self.progress.show()
+            app_idx = self.df[self.df['Solution_Name'] == app_name].index[0]
+            current_sids = set(self.df.at[app_idx, 'SIDs_For_SolutionAccess'].split(','))
+            updated_sids = current_sids - set(users_to_remove)
+            try:
+                # try removing the user sids
+                self.df.at[app_idx, 'SIDs_For_SolutionAccess'] = ','.join(updated_sids)
+                self.show_application_users(self.app_list.currentItem())
+                data_dictionary = self.df.iloc[app_idx].to_dict()
+                self.update_sharepoint_db(dictionary_as_list=[data_dictionary], operation='Update')
+                pslv_action_entry([{'SID': user_main, 'action': f'Removed users {users_to_remove} from {app_name}'}])
+                self.progress.close()
+                self.show_success_message(f"Successfully removed {len(users_to_remove)} user(s)")
+            except:
+                # on failure revert back the changes of DF
+                self.df.at[app_idx, 'SIDs_For_SolutionAccess'] = ','.join(current_sids)
+                self.show_application_users(self.app_list.currentItem())
+                self.progress.close()
+                # FIXED: Ensure message box has proper parent reference
+                QMessageBox.warning(self, "Failure",
+                                    "Failed to remove user(s)",
+                                    QMessageBox.StandardButton.Ok)
+
+    def add_multiple_users(self):
+        """
+        method for adding multiple/single user to the solution
+        :return:
+        """
+
+        if not self.app_list.currentItem():
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(self, "No Application Selected",
+                                "Please select an application first.",
+                                QMessageBox.StandardButton.Ok)
+            return
+
+        new_users = self.new_users_text.toPlainText().strip()
+        if not new_users:
+            return
+
+        # Split by newlines and commas, then clean up
+        new_users_list = set()
+        for line in new_users.split('\n'):
+            new_users_list.update(uid.strip() for uid in line.split(',') if uid.strip())
+
+        if not new_users_list:
+            return
+
+        # Create progress dialog - FIXED: Ensure proper parent reference
+        self.progress = QProgressDialog("Verifying user IDs...", None, 0, 0, self)
+        self.progress.setWindowTitle("Please Wait")
+        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.show()
+
+        # Create worker thread
+        self.thread = QThread(self)  # FIXED: Set proper parent
+        self.worker = VerificationWorker(new_users_list)
+        self.worker.moveToThread(self.thread)
+
+        # Connect signals
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.handle_verification_complete)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        # Start the thread
+        self.thread.start()
+
+    def handle_verification_complete(self, verification_results):
+        """
+        Handle the completion of ID verification
+        """
+
+        valid_ids = [uid for uid, is_valid in verification_results.items() if is_valid]
+        invalid_ids = [uid for uid, is_valid in verification_results.items() if not is_valid]
+        self.progress.close()
+
+        if valid_ids:
+            # Add verified IDs to the DataFrame
+            self.new_users_text.setPlainText(None)
+            app_name = self.app_list.currentItem().data(Qt.ItemDataRole.UserRole)
+            app_idx = self.df[self.df['Solution_Name'] == app_name].index[0]
+            current_sids = set(split_user(self.df.at[app_idx, 'SIDs_For_SolutionAccess']))
+            updated_sids = current_sids.union(valid_ids)
+            self.df.at[app_idx, 'SIDs_For_SolutionAccess'] = ','.join(updated_sids)
+            try:
+                # try adding the user sids
+                pslv_action_entry([{f'SID': user_main, 'action': f'Added users {valid_ids} to {app_name}'}])
+                data_dictionary = self.df.iloc[app_idx].to_dict()
+                self.update_sharepoint_db(dictionary_as_list=[data_dictionary], operation='Update')
+                self.show_application_users(self.app_list.currentItem())
+                self.show_success_message(f"Successfully added {len(valid_ids)} verified user(s)")
+            except:
+                # on failure revert back the changes of DF
+                current_sids = set(split_user(self.df.at[app_idx, 'SIDs_For_SolutionAccess']))
+                reverted_sids = current_sids - valid_ids
+                self.df.at[app_idx, 'SIDs_For_SolutionAccess'] = ','.join(reverted_sids)
+                self.show_application_users(self.app_list.currentItem())
+                self.show_success_message(f"Failed to add users, Please try again later... ")
+
+        if invalid_ids:
+            # Keep invalid IDs in the text edit
+            self.new_users_text.setPlainText('\n'.join(invalid_ids))
+            # FIXED: Ensure message box has proper parent reference
+            QMessageBox.warning(
+                self,
+                "Invalid IDs Found",
+                f"The following IDs could not be verified and were not added.",
+                QMessageBox.StandardButton.Ok
+            )
