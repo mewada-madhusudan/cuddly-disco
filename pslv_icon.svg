@@ -1,0 +1,38 @@
+<svg viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Mobile device frame -->
+  <rect x="20" y="30" width="80" height="120" rx="12" ry="12" fill="#0099ff" stroke="#0099ff" stroke-width="6"/>
+  
+  <!-- Screen background -->
+  <rect x="30" y="40" width="60" height="90" fill="white" rx="4" ry="4"/>
+  
+  <!-- App icons - 2x2 grid -->
+  <!-- Top left - Yellow/Orange -->
+  <rect x="38" y="48" width="22" height="22" fill="#FFB800" rx="4" ry="4"/>
+  
+  <!-- Top right - Red/Pink -->
+  <rect x="68" y="48" width="22" height="22" fill="#FF4757" rx="4" ry="4"/>
+  
+  <!-- Bottom left - Purple -->
+  <rect x="38" y="78" width="22" height="22" fill="#9B59B6" rx="4" ry="4"/>
+  
+  <!-- Bottom right - Green -->
+  <rect x="68" y="78" width="22" height="22" fill="#2ECC71" rx="4" ry="4"/>
+  
+  <!-- Home button -->
+  <circle cx="60" cy="140" r="5" fill="white"/>
+  
+  <!-- Gradient definitions -->
+  <defs>
+    <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#0099ff;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#00BCD4;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#80D8C7;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Text PSLV -->
+  <text x="120" y="100" font-family="Arial, sans-serif" font-size="70" font-weight="bold" fill="url(#gradient)">PSLV</text>
+  
+  <!-- Subtitle -->
+  <text x="120" y="125" font-family="Arial, sans-serif" font-size="16" fill="#80D8C7">Python Solution Launcher for VDI</text>
+</svg>
